@@ -56,26 +56,6 @@ environment's five evaluation tasks, with 50 episodes per task. Outputs are writ
 [run.sh](run.sh) lists one command per environment with its tuned hyperparameters, in the format
 of OGBench's `hyperparameters.sh`, and runs them in sequence:
 
-```shell
-SEED=0 ./run.sh
-```
-
-The paper reports 8 seeds for state-based tasks and 4 for pixel-based tasks. Run `run.sh` once
-per seed, or copy individual lines.
-
-### Hyperparameters
-
-Defaults are in `get_config()` in [config.py](config.py). The GITA-specific ones are:
-
-| Key | Default | Meaning |
-|---|---|---|
-| `abstraction_factors` | `(3, 5, 8, 13, 21)` | Candidate set `K` used for the high-level policy |
-| `geo_gamma` | `0.98` | `α` in `k ~ Geom(1 - α)` for value training |
-| `high_alpha` | `3.0` | AWR inverse temperature `β` of the high-level policy |
-
-Per-environment values (`--discount`, `--subgoal_steps`, `--actor_p_*`, `--encoder`, ...) are
-command-line flags. See `AGENT_OVERRIDES` in [main.py](main.py) for the full list.
-
 ## Repository structure
 
 ```
