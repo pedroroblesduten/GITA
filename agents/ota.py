@@ -82,10 +82,7 @@ class OTAAgent(flax.struct.PyTreeNode):
         }
 
     def low_actor_loss(self, batch, grad_params):
-        """Compute the low-level actor loss.
-
-        Also returns (current_state, encoded_target) for coord_decoder_loss, avoiding a redundant goal_rep forward pass.
-        """
+        """Compute the low-level actor loss."""
         v1, v2 = self.network.select('low_value')(batch['observations'], batch['low_actor_goals'])
         nv1, nv2 = self.network.select('low_value')(batch['next_observations'], batch['low_actor_goals'])
         v = (v1 + v2) / 2
@@ -121,18 +118,10 @@ class OTAAgent(flax.struct.PyTreeNode):
                 }
             )
 
-        target_reps = {
-            'current_state': batch['observations'],
-            'encoded_target': goal_reps,
-        }
-
-        return actor_loss, actor_info, target_reps
+        return actor_loss, actor_info
 
     def high_actor_loss(self, batch, grad_params):
-        """Compute the high-level actor loss (horizon = subgoal_steps).
-
-        Also returns (current_state, encoded_target) — the AWR target — for coord_decoder_loss.
-        """
+        """Compute the high-level actor loss (horizon = subgoal_steps)."""
         high_actor_goals = batch['high_actor_goals']
         high_actor_targets = batch['high_actor_targets']
 
@@ -160,39 +149,7 @@ class OTAAgent(flax.struct.PyTreeNode):
             'mse': jnp.mean((dist.mode() - target) ** 2),
             'std': jnp.mean(dist.scale_diag),
         }
-        target_reps = {
-            'current_state': batch['observations'],
-            'encoded_target': target,
-        }
-
-        return actor_loss, actor_info, target_reps
-
-    def coord_decoder_loss(self, batch, grad_params, low_target_reps, high_target_reps):
-        """MSE loss for the low- and high-level coordinate decoders: predict (x, y) from current state + encoded target.
-
-        Both decoders are independent (inputs stop-gradiented here), so this loss can't affect any other network.
-        """
-        info = {}
-
-        low_current_state = jax.lax.stop_gradient(low_target_reps['current_state'])
-        low_encoded_target = jax.lax.stop_gradient(low_target_reps['encoded_target'])
-        low_coords = batch['low_actor_goals'][:, :2]
-        low_inputs = jnp.concatenate([low_current_state, low_encoded_target], axis=-1)
-        low_pred_coords = self.network.select('coord_decoder_low')(low_inputs, params=grad_params)
-        low_loss = jnp.mean((low_pred_coords - low_coords) ** 2)
-        info['coord_decoder_loss_low'] = low_loss
-
-        high_current_state = jax.lax.stop_gradient(high_target_reps['current_state'])
-        high_encoded_target = jax.lax.stop_gradient(high_target_reps['encoded_target'])
-        high_coords = batch['high_actor_targets'][:, :2]
-        high_inputs = jnp.concatenate([high_current_state, high_encoded_target], axis=-1)
-        high_pred_coords = self.network.select('coord_decoder_high')(high_inputs, params=grad_params)
-        high_loss = jnp.mean((high_pred_coords - high_coords) ** 2)
-        info['coord_decoder_loss_high'] = high_loss
-
-        total_loss = low_loss + high_loss
-        info['coord_decoder_loss'] = total_loss
-        return total_loss, info
+        return actor_loss, actor_info
 
     @jax.jit
     def total_loss(self, batch, grad_params, rng=None):
@@ -208,21 +165,15 @@ class OTAAgent(flax.struct.PyTreeNode):
         for k, v in high_value_info.items():
             info[f'high_value/{k}'] = v
 
-        low_actor_loss, low_actor_info, low_target_reps = self.low_actor_loss(batch, grad_params)
+        low_actor_loss, low_actor_info = self.low_actor_loss(batch, grad_params)
         for k, v in low_actor_info.items():
             info[f'low_actor/{k}'] = v
 
-        high_actor_loss, high_actor_info, high_target_reps = self.high_actor_loss(batch, grad_params)
+        high_actor_loss, high_actor_info = self.high_actor_loss(batch, grad_params)
         for k, v in high_actor_info.items():
             info[f'high_actor/{k}'] = v
 
-        coord_decoder_loss, coord_decoder_info = self.coord_decoder_loss(
-            batch, grad_params, low_target_reps, high_target_reps
-        )
-        for k, v in coord_decoder_info.items():
-            info[f'coord_decoder/{k}'] = v
-
-        loss = low_value_loss + high_value_loss + low_actor_loss + high_actor_loss + coord_decoder_loss
+        loss = low_value_loss + high_value_loss + low_actor_loss + high_actor_loss
 
         return loss, info
 
@@ -260,7 +211,7 @@ class OTAAgent(flax.struct.PyTreeNode):
     ):
         """Sample actions: high_actor picks a subgoal rep, then low_actor conditions on it for raw actions.
 
-        Also returns goal_reps and its decoded (x, y) coord (via coord_decoder_high), each wrapped in a
+        Also returns goal_reps and a None placeholder, each wrapped in a
         length-1 list for interface parity with multi-stage agents. Note: goal_reps matches the
         high_actor_targets encoding, not low_actor_goals.
         """
@@ -270,15 +221,12 @@ class OTAAgent(flax.struct.PyTreeNode):
         goal_reps = high_dist.sample(seed=high_seed)
         goal_reps = goal_reps / jnp.linalg.norm(goal_reps, axis=-1, keepdims=True) * jnp.sqrt(goal_reps.shape[-1])
 
-        coord_input = jnp.concatenate([observations, goal_reps], axis=-1)
-        subgoal_coord = self.network.select('coord_decoder_high')(coord_input)
-
         low_dist = self.network.select('low_actor')(observations, goal_reps, goal_encoded=True, temperature=temperature)
         actions = low_dist.sample(seed=low_seed)
 
         if not self.config['discrete']:
             actions = jnp.clip(actions, -1, 1)
-        return actions, [goal_reps], [subgoal_coord]
+        return actions, [goal_reps], [None]
 
     @classmethod
     def create(
@@ -386,26 +334,6 @@ class OTAAgent(flax.struct.PyTreeNode):
             gc_encoder=high_actor_encoder_def,
         )
 
-        # Coordinate decoders: independent MLPs predicting (x, y) from current state + encoded target.
-        # One per stage (low, high); not referenced by any other loss.
-        coord_decoder_low_def = MLP(
-            hidden_dims=(*config['value_hidden_dims'], 2),
-            activate_final=False,
-            layer_norm=config['layer_norm'],
-        )
-        coord_decoder_high_def = MLP(
-            hidden_dims=(*config['value_hidden_dims'], 2),
-            activate_final=False,
-            layer_norm=config['layer_norm'],
-        )
-        ex_coord_input = jnp.concatenate(
-            [
-                ex_observations.reshape((ex_observations.shape[0], -1)),
-                jnp.zeros((ex_observations.shape[0], config['rep_dim'])),
-            ],
-            axis=-1,
-        )
-
         network_info = dict(
             goal_rep=(goal_rep_def, (jnp.concatenate([ex_observations, ex_goals], axis=-1))),
             low_value=(low_value_def, (ex_observations, ex_goals)),
@@ -414,8 +342,6 @@ class OTAAgent(flax.struct.PyTreeNode):
             target_high_value=(target_high_value_def, (ex_observations, ex_goals)),
             low_actor=(low_actor_def, (ex_observations, ex_goals)),
             high_actor=(high_actor_def, (ex_observations, ex_goals)),
-            coord_decoder_low=(coord_decoder_low_def, (ex_coord_input,)),
-            coord_decoder_high=(coord_decoder_high_def, (ex_coord_input,)),
         )
 
         networks = {k: v[0] for k, v in network_info.items()}

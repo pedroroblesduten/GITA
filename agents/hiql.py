@@ -92,11 +92,7 @@ class HIQLAgent(flax.struct.PyTreeNode):
         return actor_loss, actor_info
 
     def high_actor_loss(self, batch, grad_params):
-        """Compute the high-level actor loss.
-
-        Also returns (current_state, encoded_target) so total_loss can feed it into
-        coord_decoder_loss without a redundant goal_rep forward pass.
-        """
+        """Compute the high-level actor loss."""
         v1, v2 = self.network.select('value')(batch['observations'], batch['high_actor_goals'])
         nv1, nv2 = self.network.select('value')(batch['high_actor_targets'], batch['high_actor_goals'])
         v = (v1 + v2) / 2
@@ -121,28 +117,7 @@ class HIQLAgent(flax.struct.PyTreeNode):
             'mse': jnp.mean((dist.mode() - target) ** 2),
             'std': jnp.mean(dist.scale_diag),
         }
-        target_reps = {
-            'current_state': batch['observations'],
-            'encoded_target': target,
-        }
-
-        return actor_loss, actor_info, target_reps
-
-    def coord_decoder_loss(self, batch, grad_params, target_reps):
-        """MSE loss for the coordinate decoder, predicting x,y of the high-actor target.
-
-        Inputs are stop-gradiented, so this cannot affect the value/goal_rep/actor nets.
-        """
-        current_state = jax.lax.stop_gradient(target_reps['current_state'])
-        current_state = current_state.reshape((current_state.shape[0], -1))
-        encoded_target = jax.lax.stop_gradient(target_reps['encoded_target'])
-        coords = batch['high_actor_targets'][:, :2]
-
-        inputs = jnp.concatenate([current_state, encoded_target], axis=-1)
-        pred_coords = self.network.select('coord_decoder')(inputs, params=grad_params)
-        loss = jnp.mean((pred_coords - coords) ** 2)
-
-        return loss, {'coord_decoder_loss': loss}
+        return actor_loss, actor_info
 
     @jax.jit
     def total_loss(self, batch, grad_params, rng=None):
@@ -157,15 +132,11 @@ class HIQLAgent(flax.struct.PyTreeNode):
         for k, v in low_actor_info.items():
             info[f'low_actor/{k}'] = v
 
-        high_actor_loss, high_actor_info, high_actor_target_reps = self.high_actor_loss(batch, grad_params)
+        high_actor_loss, high_actor_info = self.high_actor_loss(batch, grad_params)
         for k, v in high_actor_info.items():
             info[f'high_actor/{k}'] = v
 
-        coord_decoder_loss, coord_decoder_info = self.coord_decoder_loss(batch, grad_params, high_actor_target_reps)
-        for k, v in coord_decoder_info.items():
-            info[f'coord_decoder/{k}'] = v
-
-        loss = value_loss + low_actor_loss + high_actor_loss + coord_decoder_loss
+        loss = value_loss + low_actor_loss + high_actor_loss
         return loss, info
 
     def target_update(self, network, module_name):
@@ -200,7 +171,7 @@ class HIQLAgent(flax.struct.PyTreeNode):
     ):
         """Sample actions: high-level actor picks a subgoal rep, low-level actor picks the action.
 
-        Also returns the subgoal rep and its decoded (x, y) coord, each wrapped in a
+        Also returns the subgoal rep and a None placeholder, each wrapped in a
         length-1 list to match the multi-stage hierarchical agents' interface.
         """
         high_seed, low_seed = jax.random.split(seed)
@@ -209,15 +180,12 @@ class HIQLAgent(flax.struct.PyTreeNode):
         goal_reps = high_dist.sample(seed=high_seed)
         goal_reps = goal_reps / (jnp.linalg.norm(goal_reps, axis=-1, keepdims=True) + 1e-8) * jnp.sqrt(goal_reps.shape[-1])
 
-        coord_input = jnp.concatenate([observations, goal_reps], axis=-1)
-        subgoal_coord = self.network.select('coord_decoder')(coord_input)
-
         low_dist = self.network.select('low_actor')(observations, goal_reps, goal_encoded=True, temperature=temperature)
         actions = low_dist.sample(seed=low_seed)
 
         if not self.config['discrete']:
             actions = jnp.clip(actions, -1, 1)
-        return actions, [goal_reps], [subgoal_coord]
+        return actions, [goal_reps], [None]
 
     @classmethod
     def create(
@@ -319,28 +287,12 @@ class HIQLAgent(flax.struct.PyTreeNode):
             gc_encoder=high_actor_encoder_def,
         )
 
-        # Coordinate decoder: independent MLP predicting (x, y) of the high-actor target
-        # from current state + encoded target rep. Not used by any other loss.
-        coord_decoder_def = MLP(
-            hidden_dims=(*config['value_hidden_dims'], 2),
-            activate_final=False,
-            layer_norm=config['layer_norm'],
-        )
-        ex_coord_input = jnp.concatenate(
-            [
-                ex_observations.reshape((ex_observations.shape[0], -1)),
-                jnp.zeros((ex_observations.shape[0], config['rep_dim'])),
-            ],
-            axis=-1,
-        )
-
         network_info = dict(
             goal_rep=(goal_rep_def, (jnp.concatenate([ex_observations, ex_goals], axis=-1))),
             value=(value_def, (ex_observations, ex_goals)),
             target_value=(target_value_def, (ex_observations, ex_goals)),
             low_actor=(low_actor_def, (ex_observations, ex_goals)),
             high_actor=(high_actor_def, (ex_observations, ex_goals)),
-            coord_decoder=(coord_decoder_def, (ex_coord_input,)),
         )
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
